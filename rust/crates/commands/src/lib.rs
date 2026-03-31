@@ -83,6 +83,11 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Inspect discovered Claude config files",
         argument_hint: None,
     },
+    SlashCommandSpec {
+        name: "memory",
+        summary: "Inspect loaded Claude instruction memory files",
+        argument_hint: None,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +101,7 @@ pub enum SlashCommand {
     Cost,
     Resume { session_path: Option<String> },
     Config,
+    Memory,
     Unknown(String),
 }
 
@@ -125,6 +131,7 @@ impl SlashCommand {
                 session_path: parts.next().map(ToOwned::to_owned),
             },
             "config" => Self::Config,
+            "memory" => Self::Memory,
             other => Self::Unknown(other.to_string()),
         })
     }
@@ -187,6 +194,7 @@ pub fn handle_slash_command(
         | SlashCommand::Cost
         | SlashCommand::Resume { .. }
         | SlashCommand::Config
+        | SlashCommand::Memory
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -227,6 +235,7 @@ mod tests {
             })
         );
         assert_eq!(SlashCommand::parse("/config"), Some(SlashCommand::Config));
+        assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory));
     }
 
     #[test]
@@ -241,7 +250,8 @@ mod tests {
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config"));
-        assert_eq!(slash_command_specs().len(), 9);
+        assert!(help.contains("/memory"));
+        assert_eq!(slash_command_specs().len(), 10);
     }
 
     #[test]

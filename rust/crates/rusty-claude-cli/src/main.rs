@@ -17,7 +17,8 @@ use render::{Spinner, TerminalRenderer};
 use runtime::{
     load_system_prompt, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
     ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, MessageRole,
-    PermissionMode, PermissionPolicy, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    PermissionMode, PermissionPolicy, ProjectContext, RuntimeError, Session, TokenUsage, ToolError,
+    ToolExecutor, UsageTracker,
 };
 use tools::{execute_tool, mvp_tool_specs};
 
@@ -205,27 +206,20 @@ fn resume_session(session_path: &Path, command: Option<String>) {
         }
     };
 
-    match command {
-        Some(command) if command.starts_with('/') => {
-            let Some(result) = handle_slash_command(
-                &command,
-                &session,
-                CompactionConfig {
-                    max_estimated_tokens: 0,
-                    ..CompactionConfig::default()
-                },
-            ) else {
-                eprintln!("unknown slash command: {command}");
+    match command.as_deref().and_then(SlashCommand::parse) {
+        Some(command) => match run_resume_command(session_path, &session, &command) {
+            Ok(Some(message)) => println!("{message}"),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("{error}");
                 std::process::exit(2);
-            };
-            if let Err(error) = result.session.save_to_path(session_path) {
-                eprintln!("failed to persist resumed session: {error}");
-                std::process::exit(1);
             }
-            println!("{}", result.message);
-        }
-        Some(other) => {
-            eprintln!("unsupported resumed command: {other}");
+        },
+        None if command.is_some() => {
+            eprintln!(
+                "unsupported resumed command: {}",
+                command.unwrap_or_default()
+            );
             std::process::exit(2);
         }
         None => {
@@ -235,6 +229,60 @@ fn resume_session(session_path: &Path, command: Option<String>) {
                 session.messages.len()
             );
         }
+    }
+}
+
+fn run_resume_command(
+    session_path: &Path,
+    session: &Session,
+    command: &SlashCommand,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match command {
+        SlashCommand::Help => Ok(Some(render_repl_help())),
+        SlashCommand::Compact => {
+            let Some(result) = handle_slash_command(
+                "/compact",
+                session,
+                CompactionConfig {
+                    max_estimated_tokens: 0,
+                    ..CompactionConfig::default()
+                },
+            ) else {
+                return Ok(None);
+            };
+            result.session.save_to_path(session_path)?;
+            Ok(Some(result.message))
+        }
+        SlashCommand::Status => {
+            let usage = UsageTracker::from_session(session).cumulative_usage();
+            Ok(Some(format_status_line(
+                "restored-session",
+                session.messages.len(),
+                UsageTracker::from_session(session).turns(),
+                UsageTracker::from_session(session).current_turn_usage(),
+                usage,
+                0,
+                permission_mode_label(),
+            )))
+        }
+        SlashCommand::Cost => {
+            let usage = UsageTracker::from_session(session).cumulative_usage();
+            Ok(Some(format!(
+                "cost: input_tokens={} output_tokens={} cache_creation_tokens={} cache_read_tokens={} total_tokens={}",
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_creation_input_tokens,
+                usage.cache_read_input_tokens,
+                usage.total_tokens(),
+            )))
+        }
+        SlashCommand::Config => Ok(Some(render_config_report()?)),
+        SlashCommand::Memory => Ok(Some(render_memory_report()?)),
+        SlashCommand::Resume { .. }
+        | SlashCommand::Model { .. }
+        | SlashCommand::Permissions { .. }
+        | SlashCommand::Clear
+        | SlashCommand::Unknown(_) => Err("unsupported resumed slash command".into()),
     }
 }
 
@@ -328,6 +376,7 @@ impl LiveCli {
             SlashCommand::Cost => self.print_cost(),
             SlashCommand::Resume { session_path } => self.resume_session(session_path)?,
             SlashCommand::Config => Self::print_config()?,
+            SlashCommand::Memory => Self::print_memory()?,
             SlashCommand::Unknown(name) => eprintln!("unknown slash command: /{name}"),
         }
         Ok(())
@@ -444,34 +493,12 @@ impl LiveCli {
     }
 
     fn print_config() -> Result<(), Box<dyn std::error::Error>> {
-        let cwd = env::current_dir()?;
-        let loader = ConfigLoader::default_for(&cwd);
-        let discovered = loader.discover();
-        let runtime_config = loader.load()?;
+        println!("{}", render_config_report()?);
+        Ok(())
+    }
 
-        println!(
-            "config: loaded_files={} merged_keys={}",
-            runtime_config.loaded_entries().len(),
-            runtime_config.merged().len()
-        );
-        for entry in discovered {
-            let source = match entry.source {
-                ConfigSource::User => "user",
-                ConfigSource::Project => "project",
-                ConfigSource::Local => "local",
-            };
-            let status = if runtime_config
-                .loaded_entries()
-                .iter()
-                .any(|loaded_entry| loaded_entry.path == entry.path)
-            {
-                "loaded"
-            } else {
-                "missing"
-            };
-            println!("  {source:<7} {status:<7} {}", entry.path.display());
-        }
-        println!("  merged   {}", runtime_config.as_json().render());
+    fn print_memory() -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", render_memory_report()?);
         Ok(())
     }
 
@@ -514,6 +541,77 @@ fn format_status_line(
         cumulative.output_tokens,
         cumulative.total_tokens(),
     )
+}
+
+fn render_config_report() -> Result<String, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let discovered = loader.discover();
+    let runtime_config = loader.load()?;
+
+    let mut lines = vec![format!(
+        "config: loaded_files={} merged_keys={}",
+        runtime_config.loaded_entries().len(),
+        runtime_config.merged().len()
+    )];
+    for entry in discovered {
+        let source = match entry.source {
+            ConfigSource::User => "user",
+            ConfigSource::Project => "project",
+            ConfigSource::Local => "local",
+        };
+        let status = if runtime_config
+            .loaded_entries()
+            .iter()
+            .any(|loaded_entry| loaded_entry.path == entry.path)
+        {
+            "loaded"
+        } else {
+            "missing"
+        };
+        lines.push(format!(
+            "  {source:<7} {status:<7} {}",
+            entry.path.display()
+        ));
+    }
+    lines.push(format!("  merged   {}", runtime_config.as_json().render()));
+    Ok(lines.join(
+        "
+",
+    ))
+}
+
+fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
+    let project_context = ProjectContext::discover(env::current_dir()?, DEFAULT_DATE)?;
+    let mut lines = vec![format!(
+        "memory: files={}",
+        project_context.instruction_files.len()
+    )];
+    if project_context.instruction_files.is_empty() {
+        lines.push(
+            "  No CLAUDE instruction files discovered in the current directory ancestry."
+                .to_string(),
+        );
+    } else {
+        for file in project_context.instruction_files {
+            let preview = file.content.lines().next().unwrap_or("").trim();
+            let preview = if preview.is_empty() {
+                "<empty>"
+            } else {
+                preview
+            };
+            lines.push(format!(
+                "  {} ({}) {}",
+                file.path.display(),
+                file.content.lines().count(),
+                preview
+            ));
+        }
+    }
+    Ok(lines.join(
+        "
+",
+    ))
 }
 
 fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
@@ -930,6 +1028,7 @@ mod tests {
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config"));
+        assert!(help.contains("/memory"));
         assert!(help.contains("/exit"));
     }
 
@@ -984,6 +1083,7 @@ mod tests {
             })
         );
         assert_eq!(SlashCommand::parse("/config"), Some(SlashCommand::Config));
+        assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory));
     }
 
     #[test]
